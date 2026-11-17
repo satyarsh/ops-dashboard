@@ -31,27 +31,42 @@ def ssh_command(server):
         command.extend(["-l", server.user])
     if server.identity:
         command.extend(["-i", str(Path(server.identity).expanduser())])
+    command.extend(server.ssh_args)
     command.append(server.host)
     return command
 
 
-def collect(server, hours):
+def run_collector(server, argument, timeout=155):
     remote = shlex.split(server.collector_command)
     if not remote:
         raise ValueError("Empty collector_command")
     source = Path(__file__).with_name("collect_server.py").read_text() if remote == ["python3", "-"] else None
     if server.sudo and remote[0] != "sudo":
         remote = ["sudo", "-n"] + remote
-    command = ssh_command(server) + [" ".join(shlex.quote(part) for part in remote + [str(hours)])]
-    result = subprocess.run(command, input=source, text=True, capture_output=True, timeout=155)
+    command = ssh_command(server) + [" ".join(shlex.quote(part) for part in remote + [str(argument)])]
+    result = subprocess.run(command, input=source, text=True, capture_output=True, timeout=timeout)
     if result.returncode:
-        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"SSH collector exited {result.returncode}")
+        message = result.stderr.strip() or result.stdout.strip() or f"SSH collector exited {result.returncode}"
+        if argument == "resources" and "invalid literal" in message:
+            message = "The server collector is outdated; run ansible/setup.yml to update it"
+        raise RuntimeError(message)
     try:
         payload = json.loads(result.stdout)
     except ValueError as exc:
         raise RuntimeError("Collector did not return JSON. Check remote Python and shell startup output.") from exc
     if payload.get("error") or payload.get("schema") != 1:
         raise RuntimeError(payload.get("error", "Unsupported collector response"))
+    return payload
+
+
+def collect(server, hours):
+    return run_collector(server, hours)
+
+
+def collect_resources(server):
+    payload = run_collector(server, "resources", timeout=25)
+    if payload.get("mode") != "resources":
+        raise RuntimeError("The server collector needs an update; run the Ansible setup playbook")
     return payload
 
 

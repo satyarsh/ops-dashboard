@@ -1,98 +1,120 @@
 # Ops dashboard
 
-A terminal app for checking SSL certificates, website availability and Supervisord jobs. <br>
-There is a second page which provides visibility into successful SSH logins, including usernames, source IP addresses, and timestamps. <br> It also displays audited file access and modification events, account-management activity, and changes to system and user cron files.
-
-## Prerequisites
-- macOS or Linux (Windows not tested).
-- Python 3.9 or newer, available as `python3`, with the `curses` and `ssl`
-  modules.
-- OpenSSL, available as `openssl`, for reading certificate expiry dates.
-- A working CA certificate store for Python, so HTTPS certificates can be
-  verified.
+A terminal dashboard for SSL checks, HTTP probes, Supervisor status, Linux
+access logs, and CPU/RAM/disk usage.
 
 ## Screenshots
 
 ![SSL, HTTP probes and Supervisor](docs/screenshots/status.png)
 ![Server logins and audit activity](docs/screenshots/server-access.png)
+![Server Usage](docs/screenshots/usage.png)
 
-Press `1` or `2` to switch pages. On page 2, use `l`, `f`, `U` and `c` to show
+Press `1` or `2` or `3` to switch pages. On page 2, use `l`, `f`, `U` and `c` to show
 logins, files, users and cron. Use a wide terminal so all the panels fit.
 
-## Keys
-| Key | Action |
-| --- | --- |
-| `1` / `2` | Status page / server access page |
-| `c` / `p` on page 1 | Run SSL / HTTP probes |
-| `r` on page 1 | Run all three status checks |
-| `r` on page 2 | Scan the selected server |
-| Tab | Switch panels |
-| Up/Down or `k`/`j` | Select a row and scroll |
-| `u` / `d` or PgUp/PgDn | Page up / page down in the active panel on either page, or in full-screen details |
-| Enter on servers | Scan the selected server |
-| Enter elsewhere | Open full-screen details |
-| Up/Down or `k`/`j` in details | Scroll one line |
-| Home/End or `g`/`G` in details | Jump to the top / bottom |
-| Escape, Enter or `q` in details | Close details and return to the list |
-| `l` / `f` / `U` / `c` on page 2 | Logins / files / users / cron |
-| `a` on page 2 | All events |
-| `i` on page 2 | Reload inventory |
-| `q` or Ctrl-C | Quit |
+## Requirements
 
-Use lowercase `u` for page up. The Users filter uses uppercase `U` (Shift+u).
-## SSH and Supervisor
+- macOS or Linux, Python 3.9+, OpenSSL, OpenSSH and Ansible.
+- Python's `curses` and `ssl` modules.
+- Linux servers with Python 3, SSH access and root/sudo permission for setup.
+- A terminal at least 60 columns by 16 rows. Use 110+ columns for all panels.
 
-Set up an alias in `~/.ssh/config`:
-
-```sshconfig
-Host job-server
-    HostName 192.0.2.10
-    User monitor
-    Port 2222
-    IdentityFile ~/.ssh/monitor_key
-```
-
-Connect normally first, check the host fingerprint, then exit. If your key has
-a passphrase, load it in the same terminal where you will run the app:
+Installing Ansible:
 
 ```sh
-ssh job-server
-ssh-add ~/.ssh/monitor_key
-ssh-add -l
-ssh -T -o BatchMode=yes job-server 'sudo -n supervisorctl status'
+# Debian / Ubuntu
+sudo apt install ansible
+
+# macOS
+brew install ansible
 ```
 
-`ssh-add` unlocks the key for the SSH agent. It does not change the key file or
-copy it to the server. Load it again if the agent no longer has it. Remove it
-with `ssh-add -d ~/.ssh/monitor_key` when you want.
+## Inventory
 
-Supervisor gets its configuration from `servers.ini`. Define the server and
-select it in a `[supervisor]` section:
+The dashboard and playbook both use `servers.ini`. It is a normal Ansible
+inventory, parsed by `ansible-inventory`.
 
 ```ini
 [servers]
-jobs host=192.0.2.10 user=monitor port=2222 identity_file=~/.ssh/monitor_key
+web01 ansible_host=192.0.2.20 ansible_user=monitor ansible_port=22022
 
-[supervisor]
-server=jobs
-command="sudo -n supervisorctl status"
-interval=120
+[all:vars]
+ansible_ssh_private_key_file=~/.ssh/monitor_key
+
+[supervisor_hosts]
+jobs ansible_host=192.0.2.10 ansible_user=monitor ansible_port=2222
+
+[supervisor_hosts:vars]
+supervisor_command=sudo -n supervisorctl status
+supervisor_interval=120
+supervisor_enabled=true
 ```
 
-Then run `./ops-dashboard`. The `server` value must match an inventory entry.
-If that entry is an SSH alias and you omit its connection options, SSH still
-uses its usual config for the selected alias.
+Use `ansible_host`, `ansible_user`, `ansible_port` and
+`ansible_ssh_private_key_file` for connection settings. Omitted settings use
+your SSH configuration. Ansible groups and group variables work too.
 
-`interval` is in seconds (default: 240). The default command is
-`sudo -n supervisorctl status`; change it to `supervisorctl status` if the
-account has direct access. The app does not restart jobs. `sudo` on a server
-entry controls the audit collector, not the Supervisor command.
+Put one host in `[supervisor_hosts]` to enable Supervisor. Leave that group
+empty, remove it, or set `supervisor_enabled=false` to disable the panel.
+Hosts in `[supervisor_hosts]` are monitoring-only. The setup playbook skips
+them entirely, including fact gathering. Access and resource scans skip them too.
+Supervisor must already be installed and its status command must work without
+a password prompt. In `:vars` sections, write commands without outer quotes.
 
-An empty inventory, a missing or empty `[supervisor]` section, or
-`enabled=false` in that section disables the Supervisor panel without an SSH
-connection. Invalid settings are shown as errors. No Supervisor host is assumed.
-Settings are read before each Supervisor refresh. After editing the file, press
-`r` on page 1 to apply them immediately, including enabling a disabled panel.
+## Load SSH keys
+
+Connect to each new server first and check its host fingerprint. Load encrypted
+keys in the terminal where you will run the dashboard:
+
+```sh
+ssh-add ~/.ssh/monitor_key
+ssh-add -l
+```
+
+If there is no SSH agent:
+
+```sh
+eval "$(ssh-agent -s)"
+ssh-add ~/.ssh/monitor_key
+```
+
+## Set up the servers with Ansible
+
+From the project folder:
+
+```sh
+ansible-playbook -i servers.ini ansible/setup.yml --syntax-check
+ansible-playbook -i servers.ini ansible/setup.yml -K
+```
+
+`-K` asks for the setup sudo password. Omit it if setup already has passwordless
+sudo. To set up just one server:
+
+```sh
+ansible-playbook -i servers.ini ansible/setup.yml --limit web01 -K
+```
+
+The playbook supports Debian/Ubuntu and RHEL-family servers. It installs the
+collector and auditd, starts auditing, and grants the SSH user access to the
+collector. It adds account and cron audit rules for paths that exist. Other
+audit rule files are kept. If audit rules are locked, a reboot is needed to
+load changes.
+
+For other file activity, edit these lists in `ansible/setup.yml` and rerun it:
+
+```yaml
+ops_audit_read_paths:
+  - /srv/app
+ops_audit_write_paths:
+  - /srv/app
+```
+
+Choose existing paths. Read auditing on busy directories can produce many logs.
+History starts when rules are enabled. Rerun the playbook to update an installed
+collector after changing its code.
+
+The default allowed audit lookback is 24 hours. To use another value, add it to
+`ops_collector_hours` in the playbook and rerun setup.
 
 ## Run it
 
@@ -100,249 +122,66 @@ Settings are read before each Supervisor refresh. After editing the file, press
 ./ops-dashboard
 ```
 
-## Domains and manual checks
-
-Put one hostname or URL per line in `domains.txt`:
+Put sites in `domains.txt`, one hostname or URL per line:
 
 ```text
 example.com
 https://app.example.com/health
 ```
 
-SSL and HTTP probes are manual. They do not run at startup or on a timer.
-Press `c` for SSL, `p` for HTTP probes, or `r` to run all checks on page 1.
-The domains file is read again each time.
+SSL and probes run manually. SSL checks port 443; HTTP probes use the full URL.
+Supervisor uses its inventory refresh interval.
 
-## Install the server collector
+Press `2` to scan server access. It shows logins, audited file activity,
+accounts and cron changes. The first scan saves a baseline. Snapshot changes
+only show that something changed between scans; audit records provide the
+actor and operation when available.
 
-#### This will become an ansible playbook in feature releases!
-Do this once for each server. Replace the example user, address and SSH port
-with your own values.
+Press `3` for CPU, RAM and disk usage for inventory hosts. It refreshes every
+30 seconds while that screen is open. CPU uses a one-second sample. RAM uses
+available memory. The disk column shows the fullest local filesystem; Enter
+shows all collected mounts. Network and temporary filesystems are excluded.
+Usage at 80% is a warning; 95% is critical. Failed polls keep previous values
+marked stale. Resource refreshes do not scan audit logs.
 
-1. On your Machine, open a terminal in the app folder and upload the collector:
+## Keys
 
-```sh
-scp -P 2222 collect_server.py monitor@192.0.2.20:/tmp/ops-dashboard-collect.py
-ssh -p 2222 monitor@192.0.2.20
-```
+| Key | Action |
+| --- | --- |
+| `1` / `2` / `3` | Status / server access / resources |
+| `c` / `p` on screen 1 | Run SSL / HTTP probes |
+| `r` | Refresh the current screen |
+| Tab | Switch panels |
+| Up/Down or `k`/`j` | Select a row |
+| `u` / `d` or PgUp/PgDn | Page up / down |
+| Enter on the server list | Scan that server |
+| Enter elsewhere | Open full-screen details |
+| Escape, Enter or `q` in details | Return to the list |
+| Home/End in details | Jump to the top / bottom |
+| `l` / `f` / `U` / `c` on screen 2 | Logins / files / users / cron |
+| `a` on screen 2 | All activity |
+| `i` on screen 2 or 3 | Reload inventory |
+| `q` or Ctrl-C | Quit |
 
-2. You are now on the Linux server. Install the file at the default location:
+## Arguments
 
-```sh
-sudo install -d -o root -g root -m 755 /usr/local/libexec
-sudo install -o root -g root -m 755 /tmp/ops-dashboard-collect.py /usr/local/libexec/ops-dashboard-collect
-sudo /usr/local/libexec/ops-dashboard-collect 24
-```
-
-The last command should print JSON.
-
-3. On the server, open a sudoers file:
-
-```sh
-sudo vim /etc/sudoers.d/ops-dashboard
-```
-
-Add this line, replacing `monitor` with the SSH user, then save and quit:
-
-```sudoers
-monitor ALL=(root) NOPASSWD: /usr/local/libexec/ops-dashboard-collect 24
-```
-
-Set the file permissions:
-
-```sh
-sudo chmod 440 /etc/sudoers.d/ops-dashboard
-```
-
-4. Back on your Machine, test the same command the app will use:
-
-```sh
-ssh -p 2222 monitor@192.0.2.20 'sudo -n /usr/local/libexec/ops-dashboard-collect 24'
-```
-
-It should print JSON without a sudo password prompt. If it works, add that
-server to `servers.ini`, start the app and press `2`.
-
-Leave `sudo` unset for this setup. If you change `--audit-hours`,
-update the permitted number in the sudoers rule too. The app accepts 1 to 168
-hours. The server needs auditd and rules for file history; see the next sections.
-
-The collector reads logs and metadata. It does not install or configure auditd.
-
-## Install auditd
-
-Run this on each Linux server, not on the Machine. Check what is already installed:
+| Argument | Default |
+| --- | --- |
+| `--inventory PATH` | `servers.ini` beside the app |
+| `--domains PATH` | `domains.txt` beside the app |
+| `--page status\|access\|resources` | `status` |
+| `--server NAME` | All hosts on access/resources screens |
+| `--resource-interval SECONDS` | `30` |
+| `--audit-hours HOURS` | `24`, allowed range 1–168 |
+| `--state-dir PATH` | `~/.local/state/ops-dashboard` |
+| `--cert-script PATH` | Bundled `check_certs.py` |
+| `--http-script PATH` | Bundled `check_http.py` |
+| `--once` | Print the chosen screen's checks once and exit |
+| `--help` | Show help |
 
 ```sh
-cat /etc/os-release
-command -v auditctl
-sudo systemctl status auditd
+./ops-dashboard --page resources
+./ops-dashboard --page resources --server web01 --resource-interval 10
+./ops-dashboard --page resources --once
+./ops-dashboard --page access --server web01
 ```
-
-Debian or Ubuntu:
-
-```sh
-sudo apt update
-sudo apt install auditd wtmpdb
-sudo systemctl enable --now auditd
-```
-
-RHEL, Rocky Linux, AlmaLinux or Fedora:
-
-```sh
-sudo dnf install audit
-sudo systemctl enable auditd
-sudo service auditd start
-```
-
-Check the status and rules:
-
-```sh
-sudo auditctl -s
-sudo auditctl -l
-```
-
-`enabled 1` means enabled. `enabled 2` means rules are locked until reboot.
-The `pid` should be nonzero and `lost` should be zero. A service restart does
-not unlock immutable rules. A container may not be allowed to manage host audit.
-
-## Set up audit rules
-
-Installing auditd does not record every file read. Choose which paths to watch.
-These examples use 64-bit Linux rules. On x86-64, add matching `arch=b32` rules
-if you also need to track 32-bit programs.
-
-Use `sudo vim /etc/audit/rules.d/70-ops-dashboard.rules`. For account and cron
-changes, add the lines for paths that exist on your server:
-
-```text
--a always,exit -F arch=b64 -F path=/etc/passwd -F perm=wa -k ops_dashboard
--a always,exit -F arch=b64 -F path=/etc/group -F perm=wa -k ops_dashboard
--a always,exit -F arch=b64 -F path=/etc/shadow -F perm=wa -k ops_dashboard
--a always,exit -F path=/etc/gshadow -F arch=b64 -F perm=wa -k ops_dashboard
--a always,exit -F arch=b64 -F path=/etc/crontab -F perm=wa -k ops_dashboard
--a always,exit -F arch=b64 -F dir=/etc/cron.d/ -F perm=wa -k ops_dashboard
--a always,exit -F arch=b64 -F dir=/var/spool/cron/ -F perm=wa -k ops_dashboard
-```
-
-Add similar rules for `/etc/anacrontab` and `/etc/cron.hourly`, `cron.daily`,
-`cron.weekly` and `cron.monthly` if you use them. Remove lines for missing paths.
-
-For reads and writes in a directory, replace `/srv/myapp/` with a real path:
-
-```text
--a always,exit -F arch=b64 -F dir=/srv/myapp/ -F perm=r -k ops_dashboard_read
--a always,exit -F arch=b64 -F dir=/srv/myapp/ -F perm=wa -k ops_dashboard_write
-```
-
-`r` means read/open access, `w` means write access and `a` means attribute
-changes. This also records service activity. Start with a small directory;
-read auditing on a busy tree can produce lots of logs. Directory rules do not
-cross mount points. A read event is not proof someone viewed the file on screen.
-
-Load and check the rules:
-
-```sh
-sudo augenrules --load
-sudo auditctl -l
-```
-
-Check errors, missing paths, locked rules and any existing rules that disable
-syscall auditing. Keep other applications' rules. You do not need `auditctl -D`.
-
-Try reading a file in your watched directory, then search the events:
-
-```sh
-cat /srv/myapp/example.txt
-sudo ausearch -k ops_dashboard_read -ts recent -i
-sudo ausearch -k ops_dashboard_write -ts today -i
-sudo ausearch -k ops_dashboard -ts today -i
-sudo ausearch -m ADD_USER,DEL_USER,USER_MGMT -ts today -i
-sudo ausearch -m USER_LOGIN -ts today -i
-```
-
-`auid` is the original login UID. `uid` and `euid` are the process identities.
-The login UID can stay tied to the original user after sudo. Some service
-activity has no login UID.
-
-Audit logs normally live in `/var/log/audit/`. Set rotation and disk limits in
-`/etc/audit/auditd.conf`. Records disappear when logs rotate out. The app is not
-a full log archive and cannot protect logs from root on the server.
-
-References: [auditctl](https://man7.org/linux/man-pages/man8/auditctl.8.html),
-[ausearch](https://man7.org/linux/man-pages/man8/ausearch.8.html),
-[Red Hat audit guide](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/8/html/security_hardening/auditing-the-system_security-hardening),
-[Ubuntu auditd package](https://packages.ubuntu.com/jammy/admin/auditd).
-
-## What server access shows
-
-- Successful SSH authentication from the journal: user, IP and time. This does
-  not necessarily mean the user opened an interactive shell.
-- Successful audit login events and recent `last` session records.
-- File events from the configured rule keys, with user IDs, session, executable
-  and paths when the server recorded them.
-- Account-management audit events, plus account additions/removals/changes
-  found between scans. The account list uses NSS, so it can include LDAP users.
-- Cron audit events and changes to cron metadata/hashes between scans.
-- Missing permissions, commands, audit rules and collection limits.
-
-The first successful scan saves a baseline. Snapshot changes are only known to
-have happened between scans. They do not identify the actor or exact time.
-Password hashes and cron contents are not stored on the Machine. Systemd timers
-
-are not part of the cron check.
-
-Audit and journal event times use UTC. `last` output keeps server-local time
-and is not restricted by the audit lookback. File events usually do not contain
-the client IP. The app does not guess it; an audit session ID may help connect
-the event with a login during an investigation.
-
-Snapshots and the newest 500 snapshot change records per server are stored in
-`~/.local/state/ops-dashboard`. Use `--state-dir` to change that. Removing state
-starts a new baseline. Audit/journal events are read from the server each scan.
-
-A scan reads at most 800 SSH journal entries, 100 `last` entries and a 1 MB tail
-per audit query. Limits and collection errors are shown. Missing history does
-not mean nothing happened. File activity from before auditing was configured
-cannot be recovered by this app.
-
-## Command-line options
-
-Run these from the app folder. Options can be combined, for example:
-
-```sh
-./ops-dashboard --page access --server web01 --audit-hours 24
-```
-
-| Option | What it does | Default |
-| --- | --- | --- |
-| `--help` or `-h` | Show the options and exit | — |
-| `--page status\|access` | Choose the starting page, or the page to scan with `--once` | `status` |
-| `--inventory PATH` | Use another server inventory | `servers.ini` beside the app |
-| `--server NAME` | Only load this inventory alias on the access page | All inventory servers |
-| `--audit-hours HOURS` | Audit/journal lookback, from 1 to 168 hours | `24` |
-| `--state-dir PATH` | Where account/cron snapshots are saved | `~/.local/state/ops-dashboard` |
-| `--domains PATH` | Use another domains file | `domains.txt` beside the app |
-| `--cert-script PATH` | Use another compatible certificate checker | Bundled `check_certs.py` |
-| `--http-script PATH` | Use another compatible HTTP checker | Bundled `check_http.py` |
-| `--once` | Run the selected page's checks once, print results and exit | Off |
-
-Both pages use `--inventory` to select their INI file. Supervisor uses its
-`[supervisor]` section and the named server entry. `--server` only filters the
-access page; it does not change which server the Supervisor section selects.
-The former Supervisor connection/command/interval CLI options were removed;
-configure these in the INI file instead.
-
-Examples:
-
-```sh
-./ops-dashboard --once
-./ops-dashboard --page access --once
-./ops-dashboard --inventory ./production.ini --page access --server web01
-./ops-dashboard --audit-hours 48
-./ops-dashboard --domains ./other-domains.txt
-./ops-dashboard --help
-```
-
-`--once` runs the chosen page's checks once, including manual checks. It does
-not enable an SSL or probe timer.

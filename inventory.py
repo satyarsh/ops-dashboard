@@ -1,12 +1,15 @@
-"""Server connections and Supervisor settings from a plain INI inventory."""
-from dataclasses import dataclass
+"""Use Ansible's inventory parser for the dashboard and provisioning."""
+from dataclasses import dataclass, field
+import json
 import math
+import os
 from pathlib import Path
 import shlex
+import shutil
+import subprocess
+import tempfile
 
 DEFAULT_COLLECTOR = "sudo -n /usr/local/libexec/ops-dashboard-collect"
-SERVER_KEYS = {"host", "user", "port", "identity_file", "sudo", "collector_command"}
-SUPERVISOR_KEYS = {"server", "command", "interval", "enabled"}
 
 
 @dataclass
@@ -18,6 +21,8 @@ class Server:
     identity: str = ""
     sudo: bool = False
     collector_command: str = DEFAULT_COLLECTOR
+    ssh_args: tuple = ()
+    variables: dict = field(default_factory=dict, repr=False)
 
 
 @dataclass
@@ -34,89 +39,90 @@ def boolean(value, label):
     return value in ("true", "yes", "1")
 
 
-def ini_value(value):
-    lexer = shlex.shlex(value, posix=False)
-    lexer.whitespace_split, lexer.commenters = True, "#"
-    tokens = list(lexer)
-    if len(tokens) == 1 and tokens[0].startswith(('"', "'")):
-        return shlex.split(tokens[0])[0]
-    return " ".join(tokens)
+def read_inventory(path):
+    path = Path(path).expanduser().resolve()
+    contents = path.read_text()
+    if not any(line.strip() and not line.lstrip().startswith(("#", ";")) for line in contents.splitlines()):
+        return {"_meta": {"hostvars": {}}}
+    executable = shutil.which("ansible-inventory")
+    if not executable:
+        raise ValueError("Install Ansible on this machine; ansible-inventory is not in PATH")
+    with tempfile.TemporaryDirectory(prefix="ops-inventory-") as directory:
+        env = dict(os.environ, ANSIBLE_LOCAL_TEMP=directory,
+                   ANSIBLE_INVENTORY_UNPARSED_FAILED="true", ANSIBLE_NOCOLOR="1")
+        try:
+            playbook_dir = Path(__file__).resolve().parent / "ansible"
+            result = subprocess.run([executable, "-i", str(path), "--playbook-dir", str(playbook_dir), "--list"], stdin=subprocess.DEVNULL,
+                                    capture_output=True, text=True, timeout=30, env=env)
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError("Ansible inventory parsing timed out") from exc
+    if result.returncode:
+        raise ValueError("Ansible could not read the inventory: " + (result.stderr.strip() or "invalid inventory"))
+    try:
+        data = json.loads(result.stdout)
+    except ValueError as exc:
+        raise ValueError("ansible-inventory did not return valid JSON") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("_meta", {}).get("hostvars", {}), dict):
+        raise ValueError("Invalid Ansible inventory response")
+    return data
 
 
-def read_settings(path):
-    groups, variables, supervisor, section = {}, {}, {}, None
-    for number, raw in enumerate(Path(path).expanduser().read_text().splitlines(), 1):
-        line = raw.strip()
-        if not line or line.startswith(("#", ";")):
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            section = line[1:-1].strip()
-            if not section or (":" in section and not section.endswith(":vars")):
-                raise ValueError(f"Inventory line {number}: use [group], [group:vars] or [supervisor]")
-            continue
-        if section is None:
-            raise ValueError(f"Inventory line {number}: add a [servers] section")
-        if section == "supervisor" or section.endswith(":vars"):
-            key, separator, value = line.partition("=")
-            key = key.strip()
-            allowed = SUPERVISOR_KEYS if section == "supervisor" else SERVER_KEYS
-            if not separator or key not in allowed:
-                raise ValueError(f"Inventory line {number}: unsupported setting {key!r} in [{section}]")
-            destination = supervisor if section == "supervisor" else variables.setdefault(section[:-5], {})
-            destination[key] = ini_value(value.strip())
-        else:
-            tokens = shlex.split(line, comments=True)
-            if not tokens:
-                continue
-            options = {}
-            for token in tokens[1:]:
-                key, separator, value = token.partition("=")
-                if not separator or key not in SERVER_KEYS:
-                    raise ValueError(f"Inventory line {number}: use host, user, port, identity_file, sudo or collector_command")
-                options[key] = value
-            groups.setdefault(section, []).append((tokens[0], options))
-    hosts = {}
-    for group, entries in groups.items():
-        for name, options in entries:
-            if name.startswith("-") or any(char.isspace() for char in name):
-                raise ValueError("Invalid inventory alias: " + name)
-            item = hosts.setdefault(name, {"groups": [], "options": {}})
-            item["groups"].append(group)
-            item["options"].update(options)
+def group_hosts(data, group, seen=None):
+    seen = set() if seen is None else seen
+    if group in seen:
+        return set()
+    seen.add(group)
+    entry = data.get(group, {})
+    hosts = set(entry.get("hosts", []))
+    for child in entry.get("children", []):
+        hosts.update(group_hosts(data, child, seen))
+    return hosts
+
+
+def inventory_servers(data):
+    variables = data.get("_meta", {}).get("hostvars", {})
+    names = set(variables)
+    names.update(group_hosts(data, "all"))
     servers = []
-    for name, item in hosts.items():
-        settings = dict(variables.get("all", {}))
-        for group in item["groups"]:
-            settings.update(variables.get(group, {}))
-        settings.update(item["options"])
-        host, user = settings.get("host", name), settings.get("user", "")
-        if not host or host.startswith("-") or user.startswith("-") or any(c.isspace() for c in host + user):
+    for name in sorted(names):
+        settings = variables.get(name, {})
+        host = str(settings.get("ansible_host", name))
+        user = str(settings.get("ansible_user", settings.get("ansible_ssh_user", "")))
+        if (not host or host.startswith("-") or user.startswith("-") or name.startswith("-")
+                or any(char.isspace() for char in host + user + name)):
             raise ValueError("Invalid host/user for " + name)
-        port = int(settings["port"]) if "port" in settings else 0
-        if "port" in settings and not 1 <= port <= 65535:
+        port_value = settings.get("ansible_port", settings.get("ansible_ssh_port"))
+        port = int(port_value) if port_value is not None else 0
+        if port_value is not None and not 1 <= port <= 65535:
             raise ValueError("Invalid SSH port for " + name)
-        servers.append(Server(name, host, user, port, settings.get("identity_file", ""),
-                              boolean(settings.get("sudo", "false"), "sudo for " + name),
-                              settings.get("collector_command", DEFAULT_COLLECTOR)))
-    return servers, supervisor
+        extra = shlex.split(str(settings.get("ansible_ssh_common_args", "")))
+        extra += shlex.split(str(settings.get("ansible_ssh_extra_args", "")))
+        servers.append(Server(name, host, user, port, str(settings.get("ansible_ssh_private_key_file", settings.get("ansible_private_key_file", ""))),
+                              boolean(settings.get("ansible_become", False), "ansible_become for " + name),
+                              str(settings.get("collector_command", DEFAULT_COLLECTOR)), tuple(extra), settings))
+    return servers
 
 
 def load_inventory(path):
-    return read_settings(path)[0]
+    data = read_inventory(path)
+    monitoring_only = group_hosts(data, "supervisor_hosts")
+    return [server for server in inventory_servers(data) if server.name not in monitoring_only]
 
 
 def load_supervisor(path):
-    servers, options = read_settings(path)
-    if not options or not boolean(options.get("enabled", "true"), "Supervisor enabled"):
+    data = read_inventory(path)
+    members = group_hosts(data, "supervisor_hosts")
+    servers = [server for server in inventory_servers(data) if server.name in members and
+               boolean(server.variables.get("supervisor_enabled", True), "supervisor_enabled")]
+    if not servers:
         return None
-    name = options.get("server", "")
-    server = next((server for server in servers if server.name == name), None)
-    if server is None:
-        raise ValueError("[supervisor] server must name an entry defined in the inventory")
-    interval = float(options.get("interval", 240))
+    if len(servers) != 1:
+        raise ValueError("Put exactly one enabled server in [supervisor_hosts]")
+    server = servers[0]
+    interval = float(server.variables.get("supervisor_interval", 240))
     if not math.isfinite(interval) or interval < 1:
-        raise ValueError("Supervisor interval must be at least 1 second")
-    command = options.get("command", "sudo -n supervisorctl status")
+        raise ValueError("supervisor_interval must be at least 1 second")
+    command = str(server.variables.get("supervisor_command", "sudo -n supervisorctl status"))
     if not command.strip():
-        raise ValueError("Supervisor command cannot be empty")
+        raise ValueError("supervisor_command cannot be empty")
     return Supervisor(server, command, interval)

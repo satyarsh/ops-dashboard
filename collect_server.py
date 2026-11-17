@@ -91,6 +91,88 @@ def file_snapshot():
     return result, errors
 
 
+def cpu_counters(text):
+    values = [int(value) for value in text.splitlines()[0].split()[1:9]]
+    if len(values) < 4:
+        raise ValueError("Incomplete /proc/stat CPU counters")
+    # guest/guest_nice are already included in user/nice; don't count twice.
+    total = sum(values)
+    idle = values[3] + (values[4] if len(values) > 4 else 0)
+    return total, idle
+
+
+def cpu_percent(before, after):
+    total = after[0] - before[0]
+    idle = after[1] - before[1]
+    if total <= 0:
+        return 0.0
+    return round(max(0.0, min(100.0, (total - idle) * 100 / total)), 1)
+
+
+def memory_usage(text):
+    values = {}
+    for line in text.splitlines():
+        name, _, value = line.partition(":")
+        tokens = value.split()
+        if tokens:
+            values[name] = int(tokens[0]) * 1024
+    total = values["MemTotal"]
+    available = values.get("MemAvailable")
+    if available is None:
+        available = sum(values.get(key, 0) for key in ("MemFree", "Buffers", "Cached", "SReclaimable")) - values.get("Shmem", 0)
+    available = max(0, min(total, available))
+    used = total - available
+    swap_total = values.get("SwapTotal", 0)
+    swap_used = max(0, swap_total - values.get("SwapFree", 0))
+    return {"total": total, "available": available, "used": used,
+            "percent": round(100 * used / total, 1) if total else 0,
+            "swap_total": swap_total, "swap_used": swap_used}
+
+
+def mount_paths(text):
+    paths = {"/"}
+    for line in text.splitlines():
+        before, separator, after = line.partition(" - ")
+        fields, filesystem = before.split(), after.split()
+        if not separator or len(fields) < 5 or len(filesystem) < 2:
+            continue
+        kind, source = filesystem[:2]
+        # Avoid pseudo filesystems, snap images, and network mounts that may hang.
+        if kind == "squashfs" or not (source.startswith("/dev/") or kind == "zfs"):
+            continue
+        path = re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), fields[4])
+        paths.add(path)
+    return sorted(paths, key=lambda path: (path != "/", path))
+
+
+def disk_usage(path):
+    info = os.statvfs(path)
+    size = info.f_frsize or info.f_bsize
+    total, used, available = info.f_blocks * size, (info.f_blocks - info.f_bfree) * size, info.f_bavail * size
+    # Like df: use space available to ordinary users; reserved blocks aren't free.
+    denominator = used + available
+    return {"path": path, "total": total, "used": used, "available": available,
+            "percent": round(100 * used / denominator, 1) if denominator else 0,
+            "inodes_total": info.f_files, "inodes_free": info.f_favail}
+
+
+def resource_snapshot(interval=1.0):
+    before = cpu_counters(Path("/proc/stat").read_text())
+    time.sleep(interval)
+    after = cpu_counters(Path("/proc/stat").read_text())
+    memory = memory_usage(Path("/proc/meminfo").read_text())
+    disks, errors = [], []
+    for path in mount_paths(Path("/proc/self/mountinfo").read_text()):
+        try:
+            disks.append(disk_usage(path))
+        except OSError as exc:
+            errors.append(f"{path}: {exc}")
+    return {"schema": 1, "mode": "resources", "time": datetime.now(timezone.utc).isoformat(),
+            "hostname": os.uname().nodename, "cpu_percent": cpu_percent(before, after),
+            "cpu_count": os.cpu_count(), "sample_seconds": interval,
+            "load_average": list(os.getloadavg()), "memory": memory, "disks": disks, "errors": errors}
+
+
 def collect(hours):
     since = datetime.now().astimezone() - timedelta(hours=hours)
     users = {user.pw_name: {"uid": user.pw_uid, "gid": user.pw_gid, "home": user.pw_dir, "shell": user.pw_shell}
@@ -104,7 +186,7 @@ def collect(hours):
     sources = {
         "journal": run(["journalctl", "--since", since.isoformat(), "--no-pager", "-o", "json", "-n", "800",
                         "SYSLOG_IDENTIFIER=sshd", "SYSLOG_IDENTIFIER=sshd-session"]),
-        "last": run(["last", "-i", "-F", "-n", "100"]),
+        "last": run((["last"] if shutil.which("last") else ["wtmpdb", "last"]) + ["-i", "-F", "-n", "100"]),
         "audit_status": run(["auditctl", "-s"]),
         "audit_rules": run(["auditctl", "-l"]),
         # SSH supplies a pipe as stdin. Force ausearch to use auditd's logs
@@ -126,6 +208,11 @@ def collect(hours):
 
 def main():
     try:
+        if len(sys.argv) > 2:
+            raise ValueError("Usage: ops-dashboard-collect [hours | resources]")
+        if len(sys.argv) == 2 and sys.argv[1] == "resources":
+            print(json.dumps(resource_snapshot()))
+            return 0
         hours = int(sys.argv[1]) if len(sys.argv) > 1 else 24
         if not 1 <= hours <= 168:
             raise ValueError("Lookback must be 1–168 hours")

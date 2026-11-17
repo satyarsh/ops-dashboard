@@ -1,0 +1,20 @@
+# Managed by ansible/setup.yml. Other audit rule files are not changed.
+{% set native_arch = 'b' ~ ansible_facts['userspace_bits'] %}
+{% set arches = [native_arch] + (['b32'] if native_arch == 'b64' and ansible_facts['architecture'] == 'x86_64' and ops_audit_compat32 | bool else []) %}
+{% for entry in ops_audit_path_stats.results %}
+{% if entry.stat.exists and (entry.stat.isdir | default(false) or entry.stat.isreg | default(false)) %}
+{% set path = entry.item %}
+{% for arch in arches %}
+{% set path_filter = ('dir=' ~ path.rstrip('/') ~ '/') if entry.stat.isdir | default(false) else ('path=' ~ path) %}
+{% if path in ops_account_paths or path in ops_cron_paths %}
+-a always,exit -F arch={{ arch }} -F {{ path_filter }} -F perm=wa -k ops_dashboard
+{% endif %}
+{% if path in ops_audit_read_paths %}
+-a always,exit -F arch={{ arch }} -F {{ path_filter }} -F perm=r -k ops_dashboard_read
+{% endif %}
+{% if path in ops_audit_write_paths %}
+-a always,exit -F arch={{ arch }} -F {{ path_filter }} -F perm=wa -k ops_dashboard_write
+{% endif %}
+{% endfor %}
+{% endif %}
+{% endfor %}

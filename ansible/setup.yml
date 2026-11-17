@@ -1,0 +1,179 @@
+---
+- name: Set up the Ops Dashboard collector and auditing
+  # Supervisor hosts are monitoring-only, even when also listed in another group.
+  hosts: "all:!supervisor_hosts"
+  become: true
+  gather_facts: true
+  vars:
+    ops_collector_hours: [24]
+    # Add existing directories here to record their reads and writes.
+    ops_audit_read_paths: []
+    ops_audit_write_paths: []
+    ops_audit_compat32: false
+    ops_account_paths:
+      - /etc/passwd
+      - /etc/group
+      - /etc/shadow
+      - /etc/gshadow
+    ops_cron_paths:
+      - /etc/crontab
+      - /etc/anacrontab
+      - /etc/cron.d
+      - /etc/cron.hourly
+      - /etc/cron.daily
+      - /etc/cron.weekly
+      - /etc/cron.monthly
+      - /var/spool/cron
+
+  pre_tasks:
+    - name: Check supported Linux distribution
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['system'] == 'Linux'
+          - ansible_facts['os_family'] in ['Debian', 'RedHat']
+        fail_msg: This playbook supports Debian/Ubuntu and RHEL-family Linux servers.
+
+    - name: Find the SSH account before privilege escalation
+      ansible.builtin.command: id -un
+      become: false
+      register: ops_ssh_account
+      changed_when: false
+      check_mode: false
+
+    - name: Check collector account and audit paths
+      ansible.builtin.assert:
+        that:
+          - ops_ssh_account.stdout is match('^[a-zA-Z_][a-zA-Z0-9_.-]*[$]?$')
+          - ops_collector_hours is sequence
+          - ops_collector_hours is not string
+          - (ansible_facts['userspace_bits'] | string) in ['32', '64']
+
+    - name: Check allowed lookback arguments
+      ansible.builtin.assert:
+        that:
+          - (item | string) is match('^[0-9]+$')
+          - (item | int) >= 1
+          - (item | int) <= 168
+      loop: "{{ ops_collector_hours }}"
+
+    - name: Check audit paths are absolute and contain no spaces
+      ansible.builtin.assert:
+        that:
+          - item is string
+          - item is match('^/[^\s]*$')
+          - item != '/'
+        fail_msg: Choose specific absolute paths, without spaces; do not watch the whole root filesystem.
+      loop: "{{ (ops_account_paths + ops_cron_paths + ops_audit_read_paths + ops_audit_write_paths) | unique }}"
+
+  tasks:
+    - name: Install packages on Debian and Ubuntu
+      ansible.builtin.apt:
+        name: [python3, sudo, auditd]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      when: ansible_facts['os_family'] == 'Debian'
+
+    - name: Install packages on RHEL-family servers
+      ansible.builtin.package:
+        name: [python3, sudo, audit]
+        state: present
+      when: ansible_facts['os_family'] == 'RedHat'
+
+    - name: Check whether wtmpdb is available on Debian and Ubuntu
+      ansible.builtin.command: apt-cache show wtmpdb
+      register: ops_wtmpdb_package
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: ansible_facts['os_family'] == 'Debian'
+
+    - name: Install wtmpdb when the distribution provides it
+      ansible.builtin.apt:
+        name: wtmpdb
+        state: present
+      when:
+        - ansible_facts['os_family'] == 'Debian'
+        - ops_wtmpdb_package.rc | default(1) == 0
+
+    - name: Create the collector directory
+      ansible.builtin.file:
+        path: /usr/local/libexec
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install the collector
+      ansible.builtin.copy:
+        src: ../collect_server.py
+        dest: /usr/local/libexec/ops-dashboard-collect
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Allow the SSH account to run the collector without a password
+      ansible.builtin.template:
+        src: collector.sudoers.j2
+        dest: /etc/sudoers.d/ops-dashboard
+        owner: root
+        group: root
+        mode: '0440'
+        validate: /usr/sbin/visudo -cf %s
+        backup: true
+
+    - name: Enable and start auditd
+      ansible.builtin.systemd_service:
+        name: auditd
+        enabled: true
+        state: started
+
+    - name: Inspect audit status
+      ansible.builtin.command: auditctl -s
+      register: ops_audit_status
+      changed_when: false
+      # In check mode the package/service may not exist yet.
+      when: not ansible_check_mode
+
+    - name: Check which audit paths exist
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: true
+      loop: "{{ (ops_account_paths + ops_cron_paths + ops_audit_read_paths + ops_audit_write_paths) | unique }}"
+      register: ops_audit_path_stats
+
+    - name: Require configured application audit paths to exist
+      ansible.builtin.assert:
+        that: item.stat.exists
+        fail_msg: "Configured audit path does not exist: {{ item.item }}"
+      loop: "{{ ops_audit_path_stats.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.item in ops_audit_read_paths or item.item in ops_audit_write_paths
+
+    - name: Install dashboard audit rules for existing paths
+      ansible.builtin.template:
+        src: audit.rules.j2
+        dest: /etc/audit/rules.d/70-ops-dashboard.rules
+        owner: root
+        group: root
+        mode: '0640'
+        backup: true
+      register: ops_rules_file
+      notify: Load dashboard audit rules
+
+    - name: Report when locked audit rules need a reboot
+      ansible.builtin.debug:
+        msg: Audit rules are locked. The rules file was updated; reboot the server to load it.
+      when:
+        - not ansible_check_mode
+        - ops_rules_file.changed
+        - "'enabled 2' in ops_audit_status.stdout"
+
+  handlers:
+    - name: Load dashboard audit rules
+      ansible.builtin.command: augenrules --load
+      changed_when: true
+      when:
+        - not ansible_check_mode
+        - "'enabled 2' not in ops_audit_status.stdout"
