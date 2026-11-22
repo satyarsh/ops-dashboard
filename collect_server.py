@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read Linux security metadata; output JSON. No server configuration changes."""
+"""Collect Linux metadata and resources; retain metrics only in explicit record mode."""
 import collections
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -9,6 +9,7 @@ from pathlib import Path
 import pwd
 import re
 import selectors
+import sqlite3
 import shutil
 import subprocess
 import sys
@@ -173,6 +174,96 @@ def resource_snapshot(interval=1.0):
             "load_average": list(os.getloadavg()), "memory": memory, "disks": disks, "errors": errors}
 
 
+HISTORY_DB = Path("/var/lib/ops-dashboard/metrics.sqlite3")
+HISTORY_SECONDS = 3 * 24 * 60 * 60
+
+
+def network_counters(text):
+    result = {}
+    for line in text.splitlines():
+        name, separator, values = line.partition(":")
+        fields = values.split()
+        if separator and name.strip() != "lo" and len(fields) >= 16:
+            result[name.strip()] = [int(fields[0]), int(fields[8])]
+    return result
+
+
+def block_counters(text, devices):
+    result = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) >= 10 and fields[2] in devices:
+            # Linux diskstats sectors are always 512 bytes.
+            result[fields[2]] = [int(fields[5]) * 512, int(fields[9]) * 512]
+    return result
+
+
+def counter_rates(before, after, elapsed):
+    # Avoid spikes across downtime, counter resets or device changes.
+    if not before or set(before) != set(after) or not 0 < elapsed <= 180:
+        return None, None
+    deltas = [sum(after[name][i] - before[name][i] for name in after) for i in (0, 1)]
+    if any(after[name][i] < before[name][i] for name in after for i in (0, 1)):
+        return None, None
+    return tuple(round(value / elapsed, 2) for value in deltas)
+
+
+def history_sample():
+    data = resource_snapshot()
+    disks = data["disks"]
+    worst = max(disks, key=lambda disk: disk["percent"], default={})
+    # Whole devices only, with device-mapper preferred over its backing disks.
+    block_root = Path("/sys/block")
+    devices = set()
+    for path in block_root.iterdir():
+        if path.name.startswith(("loop", "ram")):
+            continue
+        # Exclude a device already accounted for by a holder (LVM/RAID).
+        if not any((path / "holders").iterdir()):
+            devices.add(path.name)
+    return {"ts": time.time(), "cpu": data["cpu_percent"], "ram": data["memory"]["percent"],
+            "disk": worst.get("percent"), "disk_path": worst.get("path"), "errors": data["errors"],
+            "boot": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+            "uptime": float(Path("/proc/uptime").read_text().split()[0]),
+            "network": network_counters(Path("/proc/net/dev").read_text()),
+            "block": block_counters(Path("/proc/diskstats").read_text(), devices)}
+
+
+def record_metrics(path=HISTORY_DB, sample=None):
+    sample = history_sample() if sample is None else dict(sample)
+    path = Path(path)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with sqlite3.connect(str(path), timeout=10) as db:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("CREATE TABLE IF NOT EXISTS samples (slot INTEGER PRIMARY KEY, ts REAL NOT NULL, data TEXT NOT NULL)")
+        db.execute("BEGIN IMMEDIATE")
+        previous = db.execute("SELECT data FROM samples WHERE ts < ? ORDER BY slot DESC LIMIT 1", (sample["ts"],)).fetchone()
+        old = json.loads(previous[0]) if previous else {}
+        elapsed = sample["uptime"] - old.get("uptime", sample["uptime"])
+        same_boot = sample["boot"] == old.get("boot")
+        sample["rx"], sample["tx"] = counter_rates(old.get("network", {}) if same_boot else {}, sample["network"], elapsed)
+        sample["read"], sample["write"] = counter_rates(old.get("block", {}) if same_boot else {}, sample["block"], elapsed)
+        db.execute("INSERT OR IGNORE INTO samples VALUES (?, ?, ?)", (int(sample["ts"] // 60), sample["ts"], json.dumps(sample)))
+        db.execute("DELETE FROM samples WHERE ts < ?", (sample["ts"] - HISTORY_SECONDS,))
+    return {"schema": 1, "mode": "record", "time": datetime.now(timezone.utc).isoformat()}
+
+
+def read_metrics(path=HISTORY_DB, now=None):
+    now = time.time() if now is None else now
+    result = {"schema": 1, "mode": "history", "end": now, "start": now - HISTORY_SECONDS,
+              "interval": 60, "samples": [], "configured": Path(path).is_file()}
+    if not result["configured"]:
+        return result
+    with sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=10) as db:
+        records = db.execute("SELECT data FROM samples WHERE ts >= ? AND ts <= ? ORDER BY slot DESC LIMIT 4321",
+                             (result["start"], now)).fetchall()
+    for record in reversed(records):
+        sample = json.loads(record[0])
+        result["samples"].append({key: sample.get(key) for key in
+                                  ("ts", "cpu", "ram", "disk", "disk_path", "rx", "tx", "read", "write", "errors")})
+    return result
+
+
 def collect(hours):
     since = datetime.now().astimezone() - timedelta(hours=hours)
     users = {user.pw_name: {"uid": user.pw_uid, "gid": user.pw_gid, "home": user.pw_dir, "shell": user.pw_shell}
@@ -209,9 +300,15 @@ def collect(hours):
 def main():
     try:
         if len(sys.argv) > 2:
-            raise ValueError("Usage: ops-dashboard-collect [hours | resources]")
+            raise ValueError("Usage: ops-dashboard-collect [hours | resources | history | record]")
         if len(sys.argv) == 2 and sys.argv[1] == "resources":
             print(json.dumps(resource_snapshot()))
+            return 0
+        if len(sys.argv) == 2 and sys.argv[1] == "record":
+            print(json.dumps(record_metrics()))
+            return 0
+        if len(sys.argv) == 2 and sys.argv[1] == "history":
+            print(json.dumps(read_metrics()))
             return 0
         hours = int(sys.argv[1]) if len(sys.argv) > 1 else 24
         if not 1 <= hours <= 168:

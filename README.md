@@ -1,7 +1,7 @@
 # Ops dashboard
 
 A terminal dashboard for SSL checks, HTTP probes, Supervisor status, Linux
-access logs, and CPU/RAM/disk usage.
+access logs, live resource usage, and three-day metrics charts.
 
 ## Screenshots
 
@@ -9,7 +9,7 @@ access logs, and CPU/RAM/disk usage.
 ![Server logins and audit activity](docs/screenshots/server-access.png)
 ![Server Usage](docs/screenshots/usage.png)
 
-Press `1` or `2` or `3` to switch pages. On page 2, use `l`, `f`, `U` and `c` to show
+Press `1`, `2`, `3` or `4` to switch pages. On page 2, use `l`, `f`, `U` and `c` to show
 logins, files, users and cron. Use a wide terminal so all the panels fit.
 
 ## Requirements
@@ -57,7 +57,7 @@ your SSH configuration. Ansible groups and group variables work too.
 Put one host in `[supervisor_hosts]` to enable Supervisor. Leave that group
 empty, remove it, or set `supervisor_enabled=false` to disable the panel.
 Hosts in `[supervisor_hosts]` are monitoring-only. The setup playbook skips
-them entirely, including fact gathering. Access and resource scans skip them too.
+them entirely, including fact gathering. Access, resource and history scans skip them too.
 Supervisor must already be installed and its status command must work without
 a password prompt. In `:vars` sections, write commands without outer quotes.
 
@@ -99,6 +99,11 @@ collector and auditd, starts auditing, and grants the SSH user access to the
 collector. It adds account and cron audit rules for paths that exist. Other
 audit rule files are kept. If audit rules are locked, a reboot is needed to
 load changes.
+
+It also installs `ops-dashboard-metrics.timer`. This records CPU, RAM, disk
+usage, disk I/O and network I/O every minute, even when the app is closed.
+History stays on each server in `/var/lib/ops-dashboard/metrics.sqlite3` for
+three days. Supervisor hosts are excluded from all setup tasks.
 
 For other file activity, edit these lists in `ansible/setup.yml` and rerun it:
 
@@ -144,11 +149,31 @@ shows all collected mounts. Network and temporary filesystems are excluded.
 Usage at 80% is a warning; 95% is critical. Failed polls keep previous values
 marked stale. Resource refreshes do not scan audit logs.
 
+Press `4` for the past three days of metrics. Use Up/Down or `n`/`p` to switch
+servers and `u`/`d` to see more charts on smaller terminals. Charts refresh
+every minute over SSH. All charts use UTC. Enter opens a summary.
+
+History starts after you run the updated playbook. Allow a minute for the
+first sample and two for I/O rates. Missing data stays blank; old history
+cannot be recovered. CPU readings are one-second samples taken each minute.
+Chart columns show averages, with shading for the range of recorded values.
+Network rates total all non-loopback interfaces; bridges and VPNs may count
+traffic twice. Disk usage shows the fullest local filesystem. Disk I/O shows
+read/write rates for whole devices, excluding loop/ram devices and backing
+devices with holders. Reboots and counter resets leave gaps in I/O rates.
+
+Check the server timer:
+
+```sh
+sudo systemctl status ops-dashboard-metrics.timer --no-pager
+sudo journalctl -u ops-dashboard-metrics.service -n 20 --no-pager
+```
+
 ## Keys
 
 | Key | Action |
 | --- | --- |
-| `1` / `2` / `3` | Status / server access / resources |
+| `1` / `2` / `3` / `4` | Status / server access / resources / history |
 | `c` / `p` on screen 1 | Run SSL / HTTP probes |
 | `r` | Refresh the current screen |
 | Tab | Switch panels |
@@ -160,7 +185,9 @@ marked stale. Resource refreshes do not scan audit logs.
 | Home/End in details | Jump to the top / bottom |
 | `l` / `f` / `U` / `c` on screen 2 | Logins / files / users / cron |
 | `a` on screen 2 | All activity |
-| `i` on screen 2 or 3 | Reload inventory |
+| `i` on screen 2, 3 or 4 | Reload inventory |
+| Up/Down or `n`/`p` on screen 4 | Switch servers |
+| `u` / `d` on screen 4 | Previous / next charts |
 | `q` or Ctrl-C | Quit |
 
 ## Arguments
@@ -169,8 +196,8 @@ marked stale. Resource refreshes do not scan audit logs.
 | --- | --- |
 | `--inventory PATH` | `servers.ini` beside the app |
 | `--domains PATH` | `domains.txt` beside the app |
-| `--page status\|access\|resources` | `status` |
-| `--server NAME` | All hosts on access/resources screens |
+| `--page status\|access\|resources\|history` | `status` |
+| `--server NAME` | All hosts on access/resources/history screens |
 | `--resource-interval SECONDS` | `30` |
 | `--audit-hours HOURS` | `24`, allowed range 1–168 |
 | `--state-dir PATH` | `~/.local/state/ops-dashboard` |
@@ -180,6 +207,8 @@ marked stale. Resource refreshes do not scan audit logs.
 | `--help` | Show help |
 
 ```sh
+./ops-dashboard --page history
+./ops-dashboard --page history --server web01
 ./ops-dashboard --page resources
 ./ops-dashboard --page resources --server web01 --resource-interval 10
 ./ops-dashboard --page resources --once

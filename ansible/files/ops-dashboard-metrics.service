@@ -1,0 +1,17 @@
+[Unit]
+Description=Record Ops Dashboard resource history
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 /usr/local/libexec/ops-dashboard-collect record
+StateDirectory=ops-dashboard
+StateDirectoryMode=0700
+UMask=0077
+TimeoutStartSec=25
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/ops-dashboard

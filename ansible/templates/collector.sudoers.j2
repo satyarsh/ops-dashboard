@@ -1,5 +1,6 @@
 # Managed by ansible/setup.yml.
 {{ ops_ssh_account.stdout }} ALL=(root) NOPASSWD: /usr/local/libexec/ops-dashboard-collect resources
+{{ ops_ssh_account.stdout }} ALL=(root) NOPASSWD: /usr/local/libexec/ops-dashboard-collect history
 {% for hours in ops_collector_hours %}
 {{ ops_ssh_account.stdout }} ALL=(root) NOPASSWD: /usr/local/libexec/ops-dashboard-collect {{ hours | int }}
 {% endfor %}

@@ -1,0 +1,11 @@
+[Unit]
+Description=Collect Ops Dashboard metrics every minute
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=1s
+RandomizedDelaySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

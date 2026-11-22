@@ -17,6 +17,7 @@ from access_page import AccessPage
 from inventory import load_supervisor
 from server_access import ssh_command
 from resource_page import ResourcePage, size_text
+from history_page import HistoryPage, draw_history
 
 
 @dataclass
@@ -410,7 +411,7 @@ def draw_resources(screen, resources, height, width):
         put(win, 6, 2, "Waiting for results…" if busy else "No servers. Add hosts to servers.ini.", width - 6)
     else:
         put(win, height - 7, 2, f"Selected {panel.selected + 1}/{len(rows)} · Enter: full details", width - 6, curses.A_DIM)
-def tui(screen, status_panels, access, resources, initial_page="status"):
+def tui(screen, status_panels, access, resources, history, initial_page="status"):
     curses.set_escdelay(25)  # Keep Escape responsive while decoding terminal key sequences.
     curses.curs_set(0)
     if curses.has_colors():
@@ -422,17 +423,21 @@ def tui(screen, status_panels, access, resources, initial_page="status"):
     active = 0
     page = initial_page
     while True:
-        panels = status_panels if page == "status" else [access.hosts, access.activity] if page == "access" else [resources.panel]
+        panels = status_panels if page == "status" else [access.hosts, access.activity] if page == "access" else [resources.panel] if page == "resources" else [history.panel]
         refresh_automatic(status_panels)
         if page == "resources":
             refresh_automatic([resources.panel])
+        if page == "history":
+            refresh_automatic([history.panel])
         screen.erase()
         height, width = screen.getmaxyx()
-        put(screen, 0, 2, "OPS / LIVE   [1] Status   [2] Server access   [3] CPU / RAM / disk", width - 4, curses.A_BOLD | curses.color_pair(1))
-        subtitle = "SSL and probes: manual" if page == "status" else f"{access.kind} · l logins / f files / U users / c cron / a all · i reload inventory" if page == "access" else "Resource-only polling · disk max = fullest local filesystem · no audit-log scan"
+        put(screen, 0, 2, "OPS / LIVE   [1] Status   [2] Server access   [3] Resources   [4] Metrics", width - 4, curses.A_BOLD | curses.color_pair(1))
+        subtitle = "SSL and probes: manual" if page == "status" else f"{access.kind} · l logins / f files / U users / c cron / a all · i reload inventory" if page == "access" else "↑/↓ or n/p server · u/d charts · r refresh · Enter details · times UTC" if page == "history" else "Resource-only polling · disk max = fullest local filesystem · no audit-log scan"
         put(screen, 1, 2, datetime.now().strftime("%a %d %b %Y %H:%M:%S") + " · " + subtitle, width - 4, curses.A_DIM)
         if width < 60 or height < 16:
             put(screen, 4, 2, "Enlarge terminal to at least 60 columns × 16 rows.", width - 4)
+        elif page == "history":
+            draw_history(screen, history, height, width, put, state_color)
         elif page == "resources" and width >= 90:
             draw_resources(screen, resources, height, width)
         elif page == "resources":
@@ -458,20 +463,22 @@ def tui(screen, status_panels, access, resources, initial_page="status"):
         else:
             draw_panel(screen, panels[active], 3, 1, height - 5, width - 2, True)
         panel = panels[active]
-        footer = "q quit  1/2/3 screen  r run all  c SSL  p probe  Tab panel  u/d page  Enter details" if page == "status" else "q quit  1/2/3 screen  r scan server  Tab panel  u/d page  U users  Enter scan/details" if page == "access" else "q quit  1/2/3 screen  r refresh  i inventory  u/d page  Enter details"
+        footer = "q quit  1/2/3/4 screen  r run all  c SSL  p probe  Tab panel  u/d page  Enter details" if page == "status" else "q quit  1/2/3/4 screen  r scan server  Tab panel  u/d page  U users  Enter scan/details" if page == "access" else "q quit  1/2/3/4 screen  r refresh  i inventory  u/d page  Enter details"
+        if page == "history":
+            footer = "q quit  1/2/3/4 screen  ↑/↓ n/p server  u/d charts  r refresh  i inventory  Enter details"
         put(screen, height - 1, 1, footer, width - 2, curses.A_DIM)
         screen.refresh()
         key = screen.getch()
         if key in (ord("q"), ord("Q"), 3):
             return
-        if key in (ord("1"), ord("2"), ord("3")):
-            page = {ord("1"): "status", ord("2"): "access", ord("3"): "resources"}[key]
+        if key in (ord("1"), ord("2"), ord("3"), ord("4")):
+            page = {ord("1"): "status", ord("2"): "access", ord("3"): "resources", ord("4"): "history"}[key]
             active = 0
         elif key == ord("r"):
             if page == "access":
                 access.scan()
-            elif page == "resources":
-                resources.panel.refresh()
+            elif page in ("resources", "history"):
+                panels[0].refresh()
             else:
                 for item in panels:
                     item.refresh()
@@ -482,8 +489,14 @@ def tui(screen, status_panels, access, resources, initial_page="status"):
         elif page == "access" and key == ord("i"):
             if not access.activity.busy:
                 access.reload()
-        elif page == "resources" and key == ord("i"):
-            resources.panel.refresh()
+        elif page in ("resources", "history") and key == ord("i"):
+            panels[0].refresh()
+        elif page == "history" and key in (ord("d"), curses.KEY_NPAGE, ord("u"), curses.KEY_PPAGE):
+            history.chart_top += history.chart_page_size * (1 if key in (ord("d"), curses.KEY_NPAGE) else -1)
+        elif page == "history" and key in (ord("n"), ord("p"), curses.KEY_LEFT, curses.KEY_RIGHT):
+            with panel.lock:
+                direction = 1 if key in (ord("n"), curses.KEY_RIGHT) else -1
+                panel.selected = (panel.selected + direction) % max(1, len(panel.rows))
         elif key == 9:
             active = (active + 1) % len(panels)
         elif key in (ord("d"), curses.KEY_NPAGE):
@@ -500,7 +513,7 @@ def tui(screen, status_panels, access, resources, initial_page="status"):
                 access.scan()
                 active = 1
             else:
-                details_view(screen, panel, lambda: refresh_automatic(status_panels + ([resources.panel] if page == "resources" else [])))
+                details_view(screen, panel, lambda: refresh_automatic(status_panels + ([resources.panel] if page == "resources" else [history.panel] if page == "history" else [])))
 
 
 def main():
@@ -511,7 +524,7 @@ def main():
     parser.add_argument("--inventory", type=Path, default=Path(__file__).with_name("servers.ini"))
     parser.add_argument("--audit-hours", type=int, default=24, help="Audit/journal lookback, 1–168 hours (default: 24)")
     parser.add_argument("--state-dir", type=Path, default=Path.home() / ".local/state/ops-dashboard")
-    parser.add_argument("--page", choices=("status", "access", "resources"), default="status")
+    parser.add_argument("--page", choices=("status", "access", "resources", "history"), default="status")
     parser.add_argument("--resource-interval", type=float, default=30, help="Resource refresh delay in seconds (default: 30)")
     parser.add_argument("--server", help="Only load this server alias from the inventory")
     parser.add_argument("--once", action="store_true", help="Run the selected page's checks once and print results")
@@ -525,15 +538,17 @@ def main():
               supervisor_panel(args.inventory)]
     access = AccessPage(args, Panel, Row)
     resources = ResourcePage(args, Panel, Row)
+    history = HistoryPage(args, Panel, Row)
     if args.once:
-        if args.page == "resources":
-            resources.panel._run()
-            if resources.panel.error:
-                print("ERROR:", safe_text(resources.panel.error))
+        if args.page in ("resources", "history"):
+            chosen = resources.panel if args.page == "resources" else history.panel
+            chosen._run()
+            if chosen.error:
+                print("ERROR:", safe_text(chosen.error))
                 return 1
-            for row in resources.panel.rows:
+            for row in chosen.rows:
                 print(safe_text(f"{row.name} | {row.state} | {row.detail}"))
-            return int(any(row.state not in HEALTHY_STATES for row in resources.panel.rows))
+            return int(any(row.state not in HEALTHY_STATES for row in chosen.rows))
         if args.page == "access":
             if access.hosts.error:
                 print("ERROR:", access.hosts.error)
@@ -563,7 +578,7 @@ def main():
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         parser.error("Use a terminal for the TUI, or pass --once for plain output")
     try:
-        curses.wrapper(tui, panels, access, resources, args.page)
+        curses.wrapper(tui, panels, access, resources, history, args.page)
     except KeyboardInterrupt:
         pass
     return 0

@@ -47,7 +47,7 @@ def run_collector(server, argument, timeout=155):
     result = subprocess.run(command, input=source, text=True, capture_output=True, timeout=timeout)
     if result.returncode:
         message = result.stderr.strip() or result.stdout.strip() or f"SSH collector exited {result.returncode}"
-        if argument == "resources" and "invalid literal" in message:
+        if argument in ("resources", "history") and "invalid literal" in message:
             message = "The server collector is outdated; run ansible/setup.yml to update it"
         raise RuntimeError(message)
     try:
@@ -66,6 +66,13 @@ def collect(server, hours):
 def collect_resources(server):
     payload = run_collector(server, "resources", timeout=25)
     if payload.get("mode") != "resources":
+        raise RuntimeError("The server collector needs an update; run the Ansible setup playbook")
+    return payload
+
+
+def collect_history(server):
+    payload = run_collector(server, "history", timeout=25)
+    if payload.get("mode") != "history" or not isinstance(payload.get("samples"), list):
         raise RuntimeError("The server collector needs an update; run the Ansible setup playbook")
     return payload
 
