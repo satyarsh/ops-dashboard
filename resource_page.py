@@ -12,8 +12,18 @@ def size_text(value):
         size /= 1024
 
 
+def swap_percent(memory):
+    total = memory.get("swap_total", 0)
+    if total <= 0:
+        return None
+    return max(0.0, min(100.0, 100 * memory.get("swap_used", 0) / total))
+
+
 def usage_state(data):
     percentages = [data["cpu_percent"], data["memory"]["percent"]]
+    swap = swap_percent(data["memory"])
+    if swap is not None:
+        percentages.append(swap)
     percentages.extend(disk["percent"] for disk in data["disks"])
     maximum = max(percentages)
     return "CRITICAL" if maximum >= 95 else "WARNING" if maximum >= 80 or data.get("errors") or not data["disks"] else "OK"
@@ -22,8 +32,10 @@ def usage_state(data):
 def resource_details(server, data):
     memory = data["memory"]
     worst = max(data["disks"], key=lambda disk: disk["percent"], default={})
+    swap = swap_percent(memory)
+    swap_text = f"{swap:.1f}%" if swap is not None else "disabled" if "swap_total" in memory else "unavailable"
     disk_text = f"{worst['percent']:.1f}% ({worst['path']})" if worst else "unavailable"
-    lines = [f"CPU: {data['cpu_percent']:.1f}% · RAM: {memory['percent']:.1f}% · disk: {disk_text}", "",
+    lines = [f"CPU: {data['cpu_percent']:.1f}% · RAM: {memory['percent']:.1f}% · swap: {swap_text} · disk: {disk_text}", "",
              f"Resource sample for {server.name} ({data.get('hostname', server.host)}).",
              f"Collected at: {data['time']}", "",
              f"CPU: {data['cpu_percent']:.1f}% busy across {data.get('cpu_count', '?')} logical CPUs",
@@ -32,7 +44,7 @@ def resource_details(server, data):
              "", f"RAM: {memory['percent']:.1f}% used",
              f"Used: {size_text(memory['used'])}", f"Available: {size_text(memory['available'])}",
              f"Total: {size_text(memory['total'])}",
-             f"Swap: {size_text(memory.get('swap_used', 0))} used / {size_text(memory.get('swap_total', 0))} total", "", "Disks"]
+             f"Swap: {swap_text} · {size_text(memory.get('swap_used', 0))} used / {size_text(memory.get('swap_total', 0))} total", "", "Disks"]
     for disk in data["disks"]:
         lines += [f"{disk['path']}: {disk['percent']:.1f}% used",
                   f"  Used {size_text(disk['used'])} / total {size_text(disk['total'])}; available {size_text(disk['available'])}"]

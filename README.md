@@ -142,16 +142,19 @@ accounts and cron changes. The first scan saves a baseline. Snapshot changes
 only show that something changed between scans; audit records provide the
 actor and operation when available.
 
-Press `3` for CPU, RAM and disk usage for inventory hosts. It refreshes every
+Press `3` for CPU, RAM, swap and disk usage for inventory hosts. It refreshes every
 30 seconds while that screen is open. CPU uses a one-second sample. RAM uses
 available memory. The disk column shows the fullest local filesystem; Enter
 shows all collected mounts. Network and temporary filesystems are excluded.
+Swap shows used space as a percentage of total swap; `OFF` means no swap is configured.
 Usage at 80% is a warning; 95% is critical. Failed polls keep previous values
 marked stale. Resource refreshes do not scan audit logs.
 
 Press `4` for the past three days of metrics. Use Up/Down or `n`/`p` to switch
 servers and `u`/`d` to see more charts on smaller terminals. Charts refresh
-every minute over SSH. All charts use UTC. Enter opens a summary.
+every minute over SSH. Press `t` to cycle through 4h, 8h, 1d, 2d and 3d.
+Use `[` / `]` for the previous / next range. The default is 3d. Charts and
+summaries use the selected range. All charts use UTC. Enter opens a summary.
 
 History starts after you run the updated playbook. Allow a minute for the
 first sample and two for I/O rates. Missing data stays blank; old history
@@ -188,6 +191,7 @@ sudo journalctl -u ops-dashboard-metrics.service -n 20 --no-pager
 | `i` on screen 2, 3 or 4 | Reload inventory |
 | Up/Down or `n`/`p` on screen 4 | Switch servers |
 | `u` / `d` on screen 4 | Previous / next charts |
+| `t` or `[` / `]` on screen 4 | Change time range: 4h, 8h, 1d, 2d, 3d |
 | `q` or Ctrl-C | Quit |
 
 ## Arguments
@@ -199,6 +203,7 @@ sudo journalctl -u ops-dashboard-metrics.service -n 20 --no-pager
 | `--page status\|access\|resources\|history` | `status` |
 | `--server NAME` | All hosts on access/resources/history screens |
 | `--resource-interval SECONDS` | `30` |
+| `--history-hours HOURS` | `72`; choices: 4, 8, 24, 48, 72 |
 | `--audit-hours HOURS` | `24`, allowed range 1–168 |
 | `--state-dir PATH` | `~/.local/state/ops-dashboard` |
 | `--cert-script PATH` | Bundled `check_certs.py` |
@@ -208,6 +213,7 @@ sudo journalctl -u ops-dashboard-metrics.service -n 20 --no-pager
 
 ```sh
 ./ops-dashboard --page history
+./ops-dashboard --page history --history-hours 4
 ./ops-dashboard --page history --server web01
 ./ops-dashboard --page resources
 ./ops-dashboard --page resources --server web01 --resource-interval 10

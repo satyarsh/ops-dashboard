@@ -16,7 +16,7 @@ import time
 from access_page import AccessPage
 from inventory import load_supervisor
 from server_access import ssh_command
-from resource_page import ResourcePage, size_text
+from resource_page import ResourcePage, size_text, swap_percent
 from history_page import HistoryPage, draw_history
 
 
@@ -369,13 +369,14 @@ def draw_resources(screen, resources, height, width):
     put(win, 1, 2, f"{len(rows)} servers · {note}", width - 6)
     put(win, 2, 2, error or "r refresh · i reload inventory · u/d page · Enter full details", width - 6,
         curses.color_pair(4) if error else curses.A_DIM)
-    server_width = max(12, min(28, width - 86))
-    usage_width = max(15, min(28, (width - server_width - 29) // 3))
+    server_width = max(12, min(28, width - 102))
+    usage_width = max(11, min(28, (width - server_width - 29) // 4))
     usage_x = server_width + 3
-    status_x = usage_x + 3 * (usage_width + 1)
+    status_x = usage_x + 4 * (usage_width + 1)
     columns = [(2, "SERVER", server_width), (usage_x, "CPU", usage_width),
                (usage_x + usage_width + 1, "RAM", usage_width),
-               (usage_x + 2 * (usage_width + 1), "DISK MAX", usage_width),
+               (usage_x + 2 * (usage_width + 1), "SWAP", usage_width),
+               (usage_x + 3 * (usage_width + 1), "DISK MAX", usage_width),
                (status_x, "STATUS", 10), (status_x + 11, "SAMPLE", 8)]
     for x, title, span in columns:
         put(win, 4, x, title, span, curses.A_DIM)
@@ -391,21 +392,24 @@ def draw_resources(screen, resources, height, width):
         y = 5 + (index - panel.top) * 2
         data = row.metrics
         worst = max(data.get("disks", []), key=lambda disk: disk["percent"], default={})
+        memory = data.get("memory", {})
+        swap = swap_percent(memory)
+        swap_text = usage_bar(swap, usage_width) if swap is not None else "OFF" if "swap_total" in memory else "—"
         values = [row.name, usage_bar(data["cpu_percent"], usage_width) if data else "—",
                   usage_bar(data["memory"]["percent"], usage_width) if data else "—",
-                  usage_bar(worst["percent"], usage_width) if worst else "—", row.state,
+                  swap_text, usage_bar(worst["percent"], usage_width) if worst else "—", row.state,
                   data.get("time", "").split("T")[-1][:8] or "never"]
         for position, ((x, _, span), value) in enumerate(zip(columns, values)):
             attr = curses.A_REVERSE if index == panel.selected and position == 0 else 0
-            if 1 <= position <= 3 and data:
+            if 1 <= position <= 4 and data:
                 attr |= curses.color_pair(1)
-            elif position == 4:
+            elif position == 5:
                 attr |= state_color(row.state)
             put(win, y, x, value, span, attr)
         description = row.detail.splitlines()[0]
         if data and row.state not in ("STALE", "ERROR"):
             memory = data["memory"]
-            description = f"RAM {size_text(memory['used'])}/{size_text(memory['total'])} · fullest disk {worst.get('path', 'unavailable')} · sample time UTC"
+            description = f"RAM {size_text(memory['used'])}/{size_text(memory['total'])} · swap {size_text(memory.get('swap_used', 0))}/{size_text(memory.get('swap_total', 0))} · fullest disk {worst.get('path', 'unavailable')} · sample time UTC"
         put(win, y + 1, 3, description, width - 7, curses.A_DIM)
     if not rows:
         put(win, 6, 2, "Waiting for results…" if busy else "No servers. Add hosts to servers.ini.", width - 6)
@@ -432,7 +436,7 @@ def tui(screen, status_panels, access, resources, history, initial_page="status"
         screen.erase()
         height, width = screen.getmaxyx()
         put(screen, 0, 2, "OPS / LIVE   [1] Status   [2] Server access   [3] Resources   [4] Metrics", width - 4, curses.A_BOLD | curses.color_pair(1))
-        subtitle = "SSL and probes: manual" if page == "status" else f"{access.kind} · l logins / f files / U users / c cron / a all · i reload inventory" if page == "access" else "↑/↓ or n/p server · u/d charts · r refresh · Enter details · times UTC" if page == "history" else "Resource-only polling · disk max = fullest local filesystem · no audit-log scan"
+        subtitle = "SSL and probes: manual" if page == "status" else f"{access.kind} · l logins / f files / U users / c cron / a all · i reload inventory" if page == "access" else "↑/↓ or n/p server · u/d charts · t range · r refresh · Enter details · times UTC" if page == "history" else "Resource-only polling · disk max = fullest local filesystem · no audit-log scan"
         put(screen, 1, 2, datetime.now().strftime("%a %d %b %Y %H:%M:%S") + " · " + subtitle, width - 4, curses.A_DIM)
         if width < 60 or height < 16:
             put(screen, 4, 2, "Enlarge terminal to at least 60 columns × 16 rows.", width - 4)
@@ -465,7 +469,7 @@ def tui(screen, status_panels, access, resources, history, initial_page="status"
         panel = panels[active]
         footer = "q quit  1/2/3/4 screen  r run all  c SSL  p probe  Tab panel  u/d page  Enter details" if page == "status" else "q quit  1/2/3/4 screen  r scan server  Tab panel  u/d page  U users  Enter scan/details" if page == "access" else "q quit  1/2/3/4 screen  r refresh  i inventory  u/d page  Enter details"
         if page == "history":
-            footer = "q quit  1/2/3/4 screen  ↑/↓ n/p server  u/d charts  r refresh  i inventory  Enter details"
+            footer = "q quit  1/2/3/4 screen  ↑/↓ n/p server  u/d charts  t range  r refresh  Enter details"
         put(screen, height - 1, 1, footer, width - 2, curses.A_DIM)
         screen.refresh()
         key = screen.getch()
@@ -491,6 +495,8 @@ def tui(screen, status_panels, access, resources, history, initial_page="status"
                 access.reload()
         elif page in ("resources", "history") and key == ord("i"):
             panels[0].refresh()
+        elif page == "history" and key in (ord("t"), ord("["), ord("]")):
+            history.change_range(-1 if key == ord("[") else 1)
         elif page == "history" and key in (ord("d"), curses.KEY_NPAGE, ord("u"), curses.KEY_PPAGE):
             history.chart_top += history.chart_page_size * (1 if key in (ord("d"), curses.KEY_NPAGE) else -1)
         elif page == "history" and key in (ord("n"), ord("p"), curses.KEY_LEFT, curses.KEY_RIGHT):
@@ -513,6 +519,8 @@ def tui(screen, status_panels, access, resources, history, initial_page="status"
                 access.scan()
                 active = 1
             else:
+                if page == "history":
+                    history.update_details()
                 details_view(screen, panel, lambda: refresh_automatic(status_panels + ([resources.panel] if page == "resources" else [history.panel] if page == "history" else [])))
 
 
@@ -525,6 +533,7 @@ def main():
     parser.add_argument("--audit-hours", type=int, default=24, help="Audit/journal lookback, 1–168 hours (default: 24)")
     parser.add_argument("--state-dir", type=Path, default=Path.home() / ".local/state/ops-dashboard")
     parser.add_argument("--page", choices=("status", "access", "resources", "history"), default="status")
+    parser.add_argument("--history-hours", type=int, choices=(4, 8, 24, 48, 72), default=72, help="Metrics chart time range in hours (default: 72)")
     parser.add_argument("--resource-interval", type=float, default=30, help="Resource refresh delay in seconds (default: 30)")
     parser.add_argument("--server", help="Only load this server alias from the inventory")
     parser.add_argument("--once", action="store_true", help="Run the selected page's checks once and print results")

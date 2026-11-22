@@ -8,7 +8,8 @@ from inventory import load_inventory
 from resource_page import ResourcePage, size_text
 from server_access import collect_history
 
-WINDOW = 72 * 3600
+RANGES = (4, 8, 24, 48, 72)
+RANGE_LABELS = {4: "4h", 8: "8h", 24: "1d", 48: "2d", 72: "3d"}
 CHARTS = [("CPU", ("cpu",), True), ("RAM", ("ram",), True),
           ("DISK USAGE · fullest filesystem", ("disk",), True),
           ("NETWORK I/O · R receive / T transmit", ("rx", "tx"), False),
@@ -36,14 +37,23 @@ def buckets(samples, key, start, end, width):
     return [(sum(group) / len(group), min(group), max(group)) if group else None for group in groups]
 
 
-def history_details(name, data):
-    samples = data.get("samples", [])
-    lines = [f"Three-day metrics for {name}", "Times are UTC. Collection: once per minute.",
+def window_samples(data, hours=72):
+    end = data.get("end", time.time())
+    start = end - hours * 3600
+    samples = [sample for sample in data.get("samples", [])
+               if number(sample.get("ts")) and start <= sample["ts"] <= end]
+    return samples, start, end
+
+
+def history_details(name, data, hours=72):
+    samples, start, end = window_samples(data, hours)
+    lines = [f"Metrics for {name} · past {RANGE_LABELS[hours]}",
+             f"Window: {utc_time(start)} – {utc_time(end)} UTC", "Times are UTC. Collection: once per minute.",
              f"Stored samples in this window: {len(samples)}"]
     if not data.get("configured"):
         lines += ["History is not installed. Run ansible/setup.yml on this host."]
     elif not samples:
-        lines += ["Waiting for the server timer's first sample."]
+        lines += ["No samples in the selected time range."]
     else:
         lines += [f"First sample: {utc_time(samples[0]['ts'])}", f"Last sample: {utc_time(samples[-1]['ts'])}"]
         for title, keys, percent in CHARTS:
@@ -70,9 +80,21 @@ class HistoryPage:
     def __init__(self, args, panel_class, row_class):
         self.args, self.Row = args, row_class
         self.previous = {}
+        self.hours = getattr(args, "history_hours", 72)
         self.chart_top = 0
         self.chart_page_size = 1
-        self.panel = panel_class("METRICS / PAST 3 DAYS", 60, self.fetch)
+        self.panel = panel_class("METRICS / HISTORY", 60, self.fetch)
+
+    def change_range(self, direction=1):
+        self.hours = RANGES[(RANGES.index(self.hours) + direction) % len(RANGES)]
+        self.update_details()
+
+    def update_details(self):
+        with self.panel.lock:
+            for row in self.panel.rows:
+                if row.metrics:
+                    prefix = row.detail.split("\n\n", 1)[0] + "\n\n" if row.detail.startswith("Could not read history") else ""
+                    row.detail = prefix + history_details(row.name, row.metrics, self.hours)
 
     def fetch(self):
         servers = load_inventory(self.args.inventory)
@@ -94,14 +116,14 @@ class HistoryPage:
                         if samples and data["end"] - samples[-1]["ts"] > 180:
                             state = "STALE"
                         previous[key] = data
-                        detail = history_details(server.name, data)
+                        detail = history_details(server.name, data, self.hours)
                     except Exception as exc:
                         data = self.previous.get(key, {})
                         state = "STALE" if data else "ERROR"
                         detail = f"Could not read history for {server.name}: {exc}"
                         if data:
                             previous[key] = data
-                            detail += "\n\n" + history_details(server.name, data)
+                            detail += "\n\n" + history_details(server.name, data, self.hours)
                     result[server.name] = self.Row(server.name, state, detail, metrics=data)
         self.previous = previous
         return [result[s.name] for s in servers]
@@ -158,27 +180,27 @@ def draw_history(screen, history, height, width, put, state_color):
     row = rows[panel.selected] if rows else None
     remaining = max(0, int(panel.due - time.monotonic()))
     note = "Refreshing…" if busy else f"Refresh in {remaining}s"
-    title = f"METRICS / {row.name} · {panel.selected+1}/{len(rows)} · {row.state}" if row else "METRICS / PAST 3 DAYS"
+    title = f"METRICS / {row.name} · {panel.selected+1}/{len(rows)} · {row.state}" if row else f"METRICS / PAST {RANGE_LABELS[history.hours]}"
     put(screen, 3, 2, title + " · " + note, width - 4, curses.color_pair(1) | curses.A_BOLD)
     data = row.metrics if row else {}
-    samples = data.get("samples", [])
+    samples, start, end = window_samples(data, history.hours)
     message = error or (row.detail.splitlines()[0] if row and row.state in ("ERROR", "STALE") else
                        "Run ansible/setup.yml to install history collection." if row and not data.get("configured") else
-                       "Waiting for the first sample; the timer runs once per minute." if row and not samples else
-                       f"{len(samples)} samples · 72h window · amber = usage · blank = missing history")
+                       "No samples in this time range; collection runs once per minute." if row and not samples else
+                       f"{len(samples)} samples · {RANGE_LABELS[history.hours]} window · amber = usage · blank = missing history")
     if not rows and not busy and not error:
         message = "No servers. Add hosts to servers.ini; Supervisor hosts are excluded."
     put(screen, 4, 2, message, width - 4, state_color(row.state) if row and row.state in ("ERROR", "STALE") else curses.A_DIM)
-    end = data.get("end", time.time())
-    start = end - WINDOW
     columns = 2 if width >= 100 else 1
     available = height - 7
     count_rows = min(3 if columns == 2 else 5, max(1, available // 9))
     history.chart_page_size = columns * count_rows
     last_page = (len(CHARTS)-1) // history.chart_page_size * history.chart_page_size
     history.chart_top = min(max(0, history.chart_top), last_page)
+    selector = "Range: " + "  ".join(f"[{RANGE_LABELS[h]}]" if h == history.hours else RANGE_LABELS[h] for h in RANGES) + " · t cycle"
     if history.chart_page_size < len(CHARTS):
-        put(screen, 5, 2, f"Charts {history.chart_top + 1}–{min(len(CHARTS), history.chart_top + history.chart_page_size)}/{len(CHARTS)} · u/d previous/next charts", width - 4, curses.A_DIM)
+        selector += f" · charts {history.chart_top + 1}–{min(len(CHARTS), history.chart_top + history.chart_page_size)}/{len(CHARTS)}"
+    put(screen, 5, 2, selector, width - 4, curses.color_pair(1))
     card_width = (width - 3) // columns
     card_height = available // count_rows
     for offset, chart in enumerate(CHARTS[history.chart_top:history.chart_top+history.chart_page_size]):
