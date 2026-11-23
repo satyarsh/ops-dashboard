@@ -102,8 +102,19 @@ load changes.
 
 It also installs `ops-dashboard-metrics.timer`. This records CPU, RAM, disk
 usage, disk I/O and network I/O every minute, even when the app is closed.
-History stays on each server in `/var/lib/ops-dashboard/metrics.sqlite3` for
-three days. Supervisor hosts are excluded from all setup tasks.
+Metrics history is stored on each monitored server for three days. The dashboard
+reads it over SSH. Supervisor hosts are excluded from all setup tasks.
+
+### Server files
+
+| Path | Purpose |
+| --- | --- |
+| `/usr/local/libexec/ops-dashboard-collect` | Collector script |
+| `/var/lib/ops-dashboard/metrics.sqlite3` | Three days of metrics history |
+| `/etc/systemd/system/ops-dashboard-metrics.timer` | One-minute collection schedule |
+| `/etc/systemd/system/ops-dashboard-metrics.service` | Command the timer runs |
+| `/etc/sudoers.d/ops-dashboard` | Collector's passwordless sudo permissions |
+| `/etc/audit/rules.d/70-ops-dashboard.rules` | Dashboard audit rules |
 
 For other file activity, edit these lists in `ansible/setup.yml` and rerun it:
 
